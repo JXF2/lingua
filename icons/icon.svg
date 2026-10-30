@@ -1,1 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108"><rect width="108" height="108" fill="#EE5A24"/><path fill="#fff" d="M35,35 H73 A8,8 0 0 1 81,43 V61 A8,8 0 0 1 73,69 H53 L43,78 V69 H35 A8,8 0 0 1 27,61 V43 A8,8 0 0 1 35,35 Z"/><path fill="none" stroke="#EE5A24" stroke-width="4" stroke-linecap="round" d="M37,47 H71 M37,57 H60"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="12 12 84 84">
+<defs>
+<linearGradient id="a" gradientUnits="userSpaceOnUse" x1="25" y1="28" x2="69" y2="73"><stop offset="0" stop-color="#FFD9B8"/><stop offset=".6" stop-color="#FFB488"/><stop offset="1" stop-color="#F7A08C"/></linearGradient>
+<linearGradient id="b" gradientUnits="userSpaceOnUse" x1="45" y1="46" x2="83" y2="82"><stop offset="0" stop-color="#FFC9A8" stop-opacity=".55"/><stop offset="1" stop-color="#B9A0F0" stop-opacity=".95"/></linearGradient>
+</defs>
+<rect width="108" height="108" fill="#fff"/>
+<path fill="url(#a)" d="M37,28 H57 A12,12 0 0 1 69,40 V52 A12,12 0 0 1 57,64 H46 L36,73 V63.9 A12,12 0 0 1 25,52 V40 A12,12 0 0 1 37,28 Z"/>
+<path fill="url(#b)" d="M56,46 H72 A11,11 0 0 1 83,57 V65 A11,11 0 0 1 72,76 H71 V82 L64,76 H56 A11,11 0 0 1 45,65 V57 A11,11 0 0 1 56,46 Z"/>
+</svg>
