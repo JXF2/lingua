@@ -4,6 +4,7 @@
  * Lingua als Web-App (für iPhone über "Zum Home-Bildschirm"). Nachbau der Android-App:
  * Inhalte kommen aus content.json (per WebExport-Test aus dem Kotlin-Code erzeugt),
  * Übungslogik und Wiederholung entsprechen data/Exercises.kt und data/Store.kt.
+ * Erinnerungen per Benachrichtigung gibt es nur in der Android-App.
  */
 
 // ---------------------------------------------------------------- Sprachen und Kurse
@@ -98,8 +99,18 @@ const distinctBy = (list, key) => { const seen = new Set(); return list.filter(x
 // ---------------------------------------------------------------- Übungen (wie Exercises.kt)
 
 const VOCAB_MODES = ['Meaning', 'Reverse', 'Listening', 'Spell', 'Type', 'Speak'];
-const EXERCISE = new Set(['choice', 'type', 'spell', 'build', 'gap']);
+const EXERCISE = new Set(['choice', 'type', 'spell', 'build', 'gap', 'cloze', 'sort', 'card']);
 const isExercise = step => EXERCISE.has(step.type);
+
+/** Passende Zuordnungs-Übung für eine Lektion, deren Tipp von dieser Zeitform handelt (wie Drills.sortFor). */
+function sortFor(target, tipTitle) {
+  if (!tipTitle) return null;
+  const title = tipTitle.toLowerCase();
+  return CONTENT.sortSets[target].find(set => set.keywords.some(k => title.includes(k))) || null;
+}
+
+/** "j'" + "ai" ohne Leerzeichen, sonst mit. */
+const verbLine = form => form[0].endsWith("'") ? form[0] + form[1] : `${form[0]} ${form[1]}`;
 
 function Exercises(c) {
   const target = c.target, base = c.base;
@@ -126,7 +137,7 @@ function Exercises(c) {
     return { type: 'choice', item, mode, prompt, options: shuffled(options), answer };
   }
 
-  const type = item => ({ type: 'type', item, prompt: meaning(item), answer: tx(item) });
+  const type = item => ({ type: 'type', item, prompt: meaning(item), answer: tx(item), why: null });
 
   function spell(item) {
     const word = tx(item);
@@ -144,7 +155,7 @@ function Exercises(c) {
     const sentence = tx(item);
     const tgt = tokens(sentence);
     const extra = distractors(null, otherTokens(lesson, tgt), allTokens(tgt), 2);
-    return { type: 'build', item, sentence, target: tgt, tiles: shuffled(tgt.concat(extra)) };
+    return { type: 'build', item, sentence, target: tgt, tiles: shuffled(tgt.concat(extra)), why: tipOf(lesson) };
   }
 
   function gap(item, lesson) {
@@ -152,14 +163,44 @@ function Exercises(c) {
     const f = focus(item, target);
     if (f) {
       const options = shuffled([...new Set(f.alternatives.concat(f.answer))]);
-      return { type: 'gap', item, sentence, gapped: f.gapped, answer: f.answer, options };
+      return { type: 'gap', item, sentence, gapped: f.gapped, answer: f.answer, options, why: tipOf(lesson) };
     }
     const words = tokens(sentence);
     let candidates = words.map((w, i) => i).filter(i => words[i].length >= 3);
     if (!candidates.length) candidates = words.map((w, i) => i);
     const i = pick(candidates);
     const extra = distractors(words[i], otherTokens(lesson, words), allTokens(words), 2);
-    return { type: 'gap', item, sentence, gapped: withGap(sentence, i), answer: words[i], options: shuffled(extra.concat(words[i])) };
+    return { type: 'gap', item, sentence, gapped: withGap(sentence, i), answer: words[i], options: shuffled(extra.concat(words[i])), why: tipOf(lesson) };
+  }
+
+  /** Lückentext aus den Sätzen einer Lektion; null, wenn sie keine Sätze hat. */
+  function cloze(lesson) {
+    const sentences = shuffled(lesson.sentences).slice(0, 5);
+    if (!sentences.length) return null;
+    const parts = sentences.map(item => {
+      const f = focus(item, target);
+      if (f) return [f.gapped, f.answer];
+      const words = tokens(tx(item));
+      let candidates = words.map((w, i) => i).filter(i => words[i].length >= 3);
+      if (!candidates.length) candidates = words.map((w, i) => i);
+      const i = pick(candidates);
+      return [withGap(tx(item), i), words[i]];
+    });
+    const answers = parts.map(p => p[1]);
+    const extra = distractors(null, otherTokens(lesson, answers), allTokens(answers), 2);
+    return { type: 'cloze', item: sentences[0], lines: parts.map(p => p[0]), answers, bank: shuffled(answers.concat(extra)), why: tipOf(lesson) };
+  }
+
+  const typeSentence = (item, lesson) => ({ type: 'type', item, prompt: meaning(item), answer: tx(item), why: tipOf(lesson) });
+
+  /** Eintrag für Übungen außerhalb der Lektionen; zählt nicht für die Wiederholung. */
+  const helper = (id, label, targetText = label) =>
+    ({ id, t: Object.fromEntries(Object.keys(LANGS).map(l => [l, l === target ? targetText : label])) });
+
+  /** Sätze einer Zeitformen-Gruppe zuordnen: je Zeitform zwei zufällige Sätze. */
+  function sort(set, why = null) {
+    const entries = set.groups.flatMap(([name, list]) => shuffled(list).slice(0, 2).map(s => [s, name]));
+    return { type: 'sort', item: helper('sort:' + set.id, set.title[base]), categories: set.groups.map(g => g[0]), entries: shuffled(entries), why };
   }
 
   function word(item, lesson) {
@@ -241,6 +282,99 @@ function Exercises(c) {
       return steps.concat(picked.map(([s, l]) => focus(s, target) ? gap(s, l) : build(s, l)));
     },
 
+    /** Karteikarten für das Vokabeltraining. */
+    forCards(words) { return shuffled(words).map(item => ({ type: 'card', item })); },
+
+    /**
+     * Vertiefung zu einer Lektion, mit denselben Wörtern und Sätzen: 2 = Festigen
+     * (Wörter selbst schreiben, Lückentext), 3 = Anwenden (Sätze bauen und schreiben,
+     * Lückentext, bei Zeitform-Lektionen Sätze zuordnen, sprechen).
+     */
+    forStage(lesson, stage, canSpeak) {
+      const steps = [];
+      const gapText = cloze(lesson);
+      if (stage === 2) {
+        shuffled(lesson.words).forEach((w, n) => {
+          if (n % 3 === 0) steps.push(type(w));
+          else if (n % 3 === 1) steps.push(spellable(w) ? spell(w) : choice(w, 'Reverse', lesson.words));
+          else steps.push(choice(w, 'Listening', lesson.words));
+        });
+        if (gapText) steps.push(gapText);
+      } else {
+        shuffled(lesson.sentences).forEach((s, n) => {
+          if (n % 3 === 0) steps.push(build(s, lesson));
+          else if (n % 3 === 1) steps.push(gap(s, lesson));
+          else steps.push(typeSentence(s, lesson));
+        });
+        if (gapText) steps.push(gapText);
+        const tip = tipOf(lesson);
+        const set = sortFor(target, tip && tip.title);
+        if (set) steps.push(sort(set, tip));
+        // Lektionen ohne Sätze: Wörter schreiben, damit die Stufe nie leer ist.
+        if (!lesson.sentences.length) lesson.words.forEach(w => steps.push(type(w)));
+        if (canSpeak && lesson.sentences.length) {
+          const s = pick(lesson.sentences);
+          steps.push({ type: 'speak', item: s, text: tx(s) });
+        }
+      }
+      return steps;
+    },
+
+    /** Kurzes Grammatik-Training aus dem Nachschlagewerk: Erklärung, Tabelle ausfüllen, Lücken, selbst schreiben. */
+    forDrill(drill) {
+      const tip = {
+        title: drill.title[base], body: drill.intro[base], demo: [],
+        examples: drill.gaps.slice(0, 3).map(g => [tx(g), meaning(g)]),
+        sections: drill.verbs.map(v => ({ heading: `${v.inf} · ${v.tense}`, text: '', speak: true, rows: v.forms.map(f => [verbLine(f), v.inf]) })),
+      };
+      const steps = [{ type: 'explain', tip }];
+      for (const verb of drill.verbs) {
+        const forms = verb.forms.map(f => f[1]);
+        const others = drill.verbs.filter(o => o !== verb).flatMap(o => o.forms.map(f => f[1])).filter(f => !forms.includes(f));
+        const extra = shuffled([...new Set(others)]).slice(0, 2);
+        steps.push({
+          type: 'cloze', item: helper(`drill:${verb.inf}:${verb.tense}`, `${verb.inf} · ${verb.tense}`),
+          lines: verb.forms.map(f => verbLine([f[0], GAP])), answers: forms, bank: shuffled(forms.concat(extra)), why: tip,
+        });
+      }
+      for (const item of shuffled(drill.gaps).slice(0, 6)) {
+        const f = focus(item, target);
+        if (!f) continue;
+        steps.push({ type: 'gap', item, sentence: tx(item), gapped: f.gapped, answer: f.answer, options: shuffled([...new Set(f.alternatives.concat(f.answer))]), why: tip });
+      }
+      const picks = drill.verbs.flatMap(v => shuffled(v.forms).slice(0, 2).map(f => [v, f]));
+      for (const [verb, form] of shuffled(picks).slice(0, 4)) {
+        const label = `${verb.inf} · ${verb.tense} · ${form[0]}`;
+        const answer = verbLine(form);
+        steps.push({ type: 'type', item: helper('drill:' + label, label, answer), prompt: label, answer, why: tip });
+      }
+      if (drill.sort) steps.push(sort(drill.sort, tip));
+      return steps;
+    },
+
+    /** Aussprache: Laute anhören, dann ähnliche Wörter am Klang unterscheiden und nachsprechen. */
+    forSounds(group, canSpeak) {
+      const tip = { title: group.title[base], body: group.intro[base], demo: [], sections: [], examples: group.rows.map(r => [r.word, r.note[base]]) };
+      const steps = [{ type: 'explain', tip }];
+      const listen = (answer, options) =>
+        ({ type: 'choice', item: helper('sound:' + answer, answer), mode: 'Listening', prompt: answer, options: shuffled(options), answer });
+      if (!group.pairs.length) {
+        // Alphabet: jeder Buchstabe kommt genau einmal dran, mit zwei zufälligen anderen zur Auswahl.
+        const letters = group.rows.map(r => r.word);
+        for (const answer of shuffled(letters)) {
+          steps.push(listen(answer, shuffled(letters.filter(l => l !== answer)).slice(0, 2).concat(answer)));
+        }
+        return steps;
+      }
+      for (const options of shuffled(group.pairs).slice(0, 6)) steps.push(listen(pick(options), options));
+      if (canSpeak) {
+        for (const r of shuffled(group.rows).slice(0, 2)) {
+          steps.push({ type: 'speak', item: helper('sound:' + r.word, r.note[base], r.word), text: r.word });
+        }
+      }
+      return steps;
+    },
+
     /** Dieselbe Übung noch einmal, mit neu gemischten Antworten. */
     again(ex) {
       switch (ex.type) {
@@ -248,6 +382,8 @@ function Exercises(c) {
         case 'spell': return { ...ex, letters: shuffled(ex.letters) };
         case 'build': return { ...ex, tiles: shuffled(ex.tiles) };
         case 'gap': return { ...ex, options: shuffled(ex.options) };
+        case 'cloze': return { ...ex, bank: shuffled(ex.bank) };
+        case 'sort': return { ...ex, entries: shuffled(ex.entries) };
         default: return { ...ex };
       }
     },
@@ -299,6 +435,41 @@ const Store = {
   set vocabModes(modes) { this.data.vocab_modes = modes; this.save(); },
 
   doneLessons(target) { return new Set(this.data['done_' + target] || []); },
+
+  /** Geschaffte Vertiefungen als "Lektions-ID#2" und "Lektions-ID#3". */
+  allStages(target) { return new Set(this.data['deep_' + target] || []); },
+
+  /** Vertiefung abgeschlossen; zählt für Serie und Tagesziel, verschiebt aber keine Wiederholungstermine. */
+  completeStage(target, lessonId, stage) {
+    const deep = this.allStages(target);
+    deep.add(`${lessonId}#${stage}`);
+    this.data['deep_' + target] = [...deep];
+    this.registerStudy();
+    this.save();
+  },
+
+  /** Tagesziel: abgeschlossene Übungen pro Tag; 0 = kein Ziel gesetzt. */
+  get goalPerDay() { return this.data.goal_per_day || 0; },
+  get goalDays() { return this.data.goal_days || 7; },
+  get goalStake() { return this.data.goal_stake || ''; },
+
+  setGoal(perDay, days, stake) {
+    // Ein geändertes Ziel beginnt bei null; den Einsatz zu ändern lässt den Stand stehen.
+    if (perDay !== this.goalPerDay || days !== this.goalDays) {
+      this.data.goal_hits = 0;
+      delete this.data.goal_hit_day;
+    }
+    this.data.goal_per_day = perDay;
+    this.data.goal_days = days;
+    this.data.goal_stake = stake;
+    this.save();
+  },
+
+  /** Heute abgeschlossene Übungen. */
+  get todayCount() { return this.data.count_day === today() ? this.data.count || 0 : 0; },
+
+  /** Tage in Folge mit erreichtem Ziel; eine Lücke setzt die Zählung zurück. */
+  get goalStreak() { return this.data.goal_hit_day >= today() - 1 ? this.data.goal_hits || 0 : 0; },
 
   nextLesson(target, level) {
     const done = this.doneLessons(target);
@@ -358,6 +529,13 @@ const Store = {
 
   registerStudy() {
     const t = today(), last = this.data.last_day;
+    const count = this.todayCount + 1;
+    if (this.goalPerDay > 0 && count === this.goalPerDay) {
+      this.data.goal_hits = this.goalStreak + 1;
+      this.data.goal_hit_day = t;
+    }
+    this.data.count = count;
+    this.data.count_day = t;
     if (last === t) return;
     this.data.streak = last === t - 1 ? (this.data.streak || 0) + 1 : 1;
     this.data.last_day = t;
@@ -366,6 +544,7 @@ const Store = {
   reset(target) {
     delete this.data['done_' + target];
     delete this.data['review_' + target];
+    delete this.data['deep_' + target];
     this.save();
   },
 };
@@ -539,7 +718,117 @@ const STRINGS = {
   },
 };
 
+/** Texte der Vertiefungen, Drills, Ziele und Auszeichnungen (wie ui/Extras.kt, ohne Erinnerungen). */
+const EXTRAS = {
+  de: {
+    stageNames: ['Lektion', 'Festigen', 'Anwenden'],
+    stageHints: ['Neue Wörter und die Grammatik', 'Wörter selbst schreiben, Lückentext', 'Sätze bauen und schreiben, Lückentext'],
+    pickExercise: 'Welche Übung?', stageDone: 'Vertiefung geschafft!', hint: 'Tipp', why: 'Warum?', fullRule: 'Ganze Erklärung', close: 'Schliessen',
+    promptCloze: 'Zieh die Wörter an die richtige Stelle', promptSort: 'Welche Zeitform ist das?',
+    cardFlip: 'Tippen zum Umdrehen', cardKnew: 'Gewusst', cardAgain: 'Nochmal', promptCard: 'Karteikarte',
+    vocabSetup: 'Vokabeln üben', levelLabel: 'Stufe', topics: 'Themen', allTopics: 'Alle Themen', howToPractise: 'Wie möchtest du üben?',
+    modeExercises: 'Übungen', modeCards: 'Karteikarten', wordsCount: n => `${n} Wörter`,
+    sounds: 'Aussprache', soundsHint: 'Buchstaben und Laute anhören und unterscheiden',
+    drills: 'Kurz üben', drillsHint: 'Verbformen und Zeitformen interaktiv trainieren', reference: 'Nachschlagen',
+    goal: 'Dein Ziel', goalPerDay: 'Übungen pro Tag', goalOff: 'Aus', goalToday: (d, g) => `Heute: ${d} von ${g}`,
+    goalRun: (r, d) => `${r} von ${d} Tagen in Folge geschafft`, goalDays: 'Wie viele Tage in Folge?',
+    bet: 'Wette mit einer Freundin oder einem Freund', betStake: 'Einsatz', betStakeHint: 'z. B. ein Kaffee', betSend: 'Wette senden',
+    betText: (p, d, s) => `Wette gilt! 🤝 Ich mache ${d} Tage in Folge je ${p} Übung(en) in Lingua.` + (s.trim() ? ` Schaffe ich es nicht, schulde ich dir: ${s}.` : ''),
+    betWon: (d, s) => `Gewonnen! 🎉 Ich habe ${d} Tage in Folge durchgezogen.` + (s.trim() ? ` Du schuldest mir: ${s}. Danke im Voraus.` : ''),
+    save: 'Speichern', awardNew: 'Unit geschafft – Auszeichnung!', awardShare: 'Auszeichnung senden', awards: 'Deine Auszeichnungen',
+    awardsEmpty: 'Schliesse eine Unit ab, dann gibt es hier etwas zum Angeben.', awardFooter: l => `Offiziell verliehen von Lingua · ${l}`,
+    copied: 'In die Zwischenablage kopiert', copyHint: 'Text zum Kopieren',
+  },
+  en: {
+    stageNames: ['Lesson', 'Reinforce', 'Apply'],
+    stageHints: ['New words and the grammar', 'Write the words yourself, gap text', 'Build and write sentences, gap text'],
+    pickExercise: 'Which exercise?', stageDone: 'Practice complete!', hint: 'Hint', why: 'Why?', fullRule: 'Full explanation', close: 'Close',
+    promptCloze: 'Drag the words to the right place', promptSort: 'Which tense is this?',
+    cardFlip: 'Tap to flip', cardKnew: 'Knew it', cardAgain: 'Again', promptCard: 'Flashcard',
+    vocabSetup: 'Practise vocabulary', levelLabel: 'Level', topics: 'Topics', allTopics: 'All topics', howToPractise: 'How do you want to practise?',
+    modeExercises: 'Exercises', modeCards: 'Flashcards', wordsCount: n => `${n} words`,
+    sounds: 'Pronunciation', soundsHint: 'Listen to letters and sounds and tell them apart',
+    drills: 'Quick practice', drillsHint: 'Train verb forms and tenses interactively', reference: 'Look up',
+    goal: 'Your goal', goalPerDay: 'Exercises per day', goalOff: 'Off', goalToday: (d, g) => `Today: ${d} of ${g}`,
+    goalRun: (r, d) => `${r} of ${d} days in a row done`, goalDays: 'How many days in a row?',
+    bet: 'Bet with a friend', betStake: 'Stake', betStakeHint: 'e.g. a coffee', betSend: 'Send bet',
+    betText: (p, d, s) => `It's a bet! 🤝 I'll do ${p} exercise(s) a day in Lingua for ${d} days in a row.` + (s.trim() ? ` If I fail, I owe you: ${s}.` : ''),
+    betWon: (d, s) => `I won! 🎉 I kept it up for ${d} days in a row.` + (s.trim() ? ` You owe me: ${s}. Thanks in advance.` : ''),
+    save: 'Save', awardNew: 'Unit complete – award!', awardShare: 'Send award', awards: 'Your awards',
+    awardsEmpty: "Finish a unit and you'll have something to brag about here.", awardFooter: l => `Officially awarded by Lingua · ${l}`,
+    copied: 'Copied to clipboard', copyHint: 'Text to copy',
+  },
+  fr: {
+    stageNames: ['Leçon', 'Consolider', 'Appliquer'],
+    stageHints: ['Nouveaux mots et grammaire', 'Écrire les mots, texte à trous', 'Construire et écrire des phrases, texte à trous'],
+    pickExercise: 'Quel exercice ?', stageDone: 'Approfondissement réussi !', hint: 'Indice', why: 'Pourquoi ?', fullRule: 'Explication complète', close: 'Fermer',
+    promptCloze: 'Fais glisser les mots au bon endroit', promptSort: 'Quel est ce temps ?',
+    cardFlip: 'Appuie pour retourner', cardKnew: 'Je savais', cardAgain: 'Encore', promptCard: 'Carte',
+    vocabSetup: 'Réviser le vocabulaire', levelLabel: 'Niveau', topics: 'Thèmes', allTopics: 'Tous les thèmes', howToPractise: "Comment veux-tu t'entraîner ?",
+    modeExercises: 'Exercices', modeCards: 'Cartes', wordsCount: n => `${n} mots`,
+    sounds: 'Prononciation', soundsHint: 'Écouter les lettres et les sons et les distinguer',
+    drills: "S'entraîner", drillsHint: 'Travailler les formes verbales et les temps', reference: 'Consulter',
+    goal: 'Ton objectif', goalPerDay: 'Exercices par jour', goalOff: 'Non', goalToday: (d, g) => `Aujourd'hui : ${d} sur ${g}`,
+    goalRun: (r, d) => `${r} jours d'affilée sur ${d}`, goalDays: "Combien de jours d'affilée ?",
+    bet: 'Pari avec un·e ami·e', betStake: 'Mise', betStakeHint: 'p. ex. un café', betSend: 'Envoyer le pari',
+    betText: (p, d, s) => `Pari tenu ! 🤝 Je fais ${p} exercice(s) par jour dans Lingua pendant ${d} jours d'affilée.` + (s.trim() ? ` Si j'échoue, je te dois : ${s}.` : ''),
+    betWon: (d, s) => `Gagné ! 🎉 J'ai tenu ${d} jours d'affilée.` + (s.trim() ? ` Tu me dois : ${s}. Merci d'avance.` : ''),
+    save: 'Enregistrer', awardNew: 'Unité terminée – distinction !', awardShare: 'Envoyer la distinction', awards: 'Tes distinctions',
+    awardsEmpty: 'Termine une unité et tu auras de quoi te vanter ici.', awardFooter: l => `Décerné officiellement par Lingua · ${l}`,
+    copied: 'Copié dans le presse-papiers', copyHint: 'Texte à copier',
+  },
+};
+
+/** Augenzwinkernde Auszeichnungen für abgeschlossene Units (wie data/Awards.kt); {u} = Name der Unit. */
+const AWARDS = {
+  de: [
+    ['🏅', 'Grossmeister:in von «{u}»', 'Darf jetzt beim Apéro ungefragt damit angeben.'],
+    ['👑', 'Königliche Hoheit von «{u}»', 'Bitte künftig mit einer leichten Verbeugung ansprechen.'],
+    ['🥇', 'Olympiasieg in «{u}»', 'Die Dopingprobe fand nur Kaffee.'],
+    ['🎓', 'Ehrendoktorat in «{u}»', 'Verliehen von einer App, also praktisch Harvard.'],
+    ['🦸', 'Superkraft freigeschaltet: «{u}»', 'Mit grosser Grammatik kommt grosse Verantwortung.'],
+    ['🧙', 'Zauberlehrling a. D. für «{u}»', 'Hat die Vokabeln gerufen, und sie sind sogar geblieben.'],
+    ['🏆', 'Goldener Wortschatz für «{u}»', 'Die Jury war sprachlos, das Publikum auch.'],
+    ['🐐', 'Ziege des Jahres in «{u}»', 'G.O.A.T. – Greatest Of All Tenses.'],
+  ],
+  en: [
+    ['🏅', 'Grand Master of “{u}”', 'May now brag about it at parties, uninvited.'],
+    ['👑', 'Royal Highness of “{u}”', 'Kindly address with a slight bow from now on.'],
+    ['🥇', 'Olympic gold in “{u}”', 'The doping test only found coffee.'],
+    ['🎓', 'Honorary doctorate in “{u}”', 'Awarded by an app, so basically Harvard.'],
+    ['🦸', 'Superpower unlocked: “{u}”', 'With great grammar comes great responsibility.'],
+    ['🧙', "Retired sorcerer's apprentice of “{u}”", 'Summoned the vocabulary, and it actually stayed.'],
+    ['🏆', 'Golden Lexicon for “{u}”', 'The jury was speechless. So was the audience.'],
+    ['🐐', 'Goat of the year in “{u}”', 'G.O.A.T. – Greatest Of All Tenses.'],
+  ],
+  fr: [
+    ['🏅', 'Grand Maître de « {u} »', "Peut désormais s'en vanter à l'apéro, sans qu'on lui demande."],
+    ['👑', 'Altesse royale de « {u} »', "Merci de vous incliner légèrement à l'avenir."],
+    ['🥇', "Médaille d'or en « {u} »", "Le contrôle antidopage n'a trouvé que du café."],
+    ['🎓', 'Doctorat honoris causa en « {u} »', 'Décerné par une appli, donc pratiquement la Sorbonne.'],
+    ['🦸', 'Super-pouvoir débloqué : « {u} »', 'Une grande grammaire implique de grandes responsabilités.'],
+    ['🧙', 'Apprenti sorcier retraité de « {u} »', 'A invoqué le vocabulaire, et il est resté.'],
+    ['🏆', "Lexique d'or pour « {u} »", 'Le jury est resté sans voix. Le public aussi.'],
+    ['🐐', "Chèvre de l'année en « {u} »", 'G.O.A.T. – Greatest Of All Tenses.'],
+  ],
+};
+
+/** Wie String.hashCode in Kotlin, damit eine Unit dieselbe Auszeichnung wie in der Android-App bekommt. */
+function javaHash(t) {
+  let hash = 0;
+  for (let i = 0; i < t.length; i++) hash = (Math.imul(hash, 31) + t.charCodeAt(i)) | 0;
+  return hash;
+}
+
+function awardOf(c, level, chapter) {
+  const pool = AWARDS[c.base];
+  const n = pool.length;
+  const [emoji, title, line] = pool[((javaHash(c.target + level.name + chapter.title.de) % n) + n) % n];
+  return { emoji, title: title.replace('{u}', chapter.title[c.base]), line };
+}
+
 let S = STRINGS.de;
+let X = EXTRAS.de;
 
 const courseTitle = c => `${LANGS[c.target].flag} ${STRINGS[c.base].langName(c.target)}`;
 function courseSubtitle(c) {
@@ -608,11 +897,38 @@ function audioButton(t, { size = 48, autoPlay = false } = {}) {
 
 function dialog({ title, body, actions }) {
   const scrim = h('div', { class: 'scrim', onclick: e => { if (e.target === scrim) close(); } },
-    h('div', { class: 'dialog', role: 'dialog' }, h('h3', {}, title), body, h('div', { class: 'actions' }, actions(close))));
+    h('div', { class: 'dialog', role: 'dialog' }, h('h3', {}, title), h('div', { class: 'dialog-body' }, body), h('div', { class: 'actions' }, actions(close))));
   function close() { scrim.remove(); }
   document.body.append(scrim);
   return close;
 }
+
+function toast(message) {
+  const el = h('div', { class: 'toast' }, message);
+  document.body.append(el);
+  setTimeout(() => el.remove(), 2200);
+}
+
+/** Text über das System-Teilen-Menü senden; ohne Menü in die Zwischenablage. */
+async function shareText(t) {
+  try {
+    if (navigator.share) { await navigator.share({ text: t }); return; }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+  }
+  try {
+    await navigator.clipboard.writeText(t);
+    toast(X.copied);
+  } catch (e) {
+    dialog({
+      title: X.copyHint,
+      body: h('div', { class: 'body-m pre', style: 'user-select:text;-webkit-user-select:text' }, t),
+      actions: close => [h('button', { class: 'text-btn', onclick: close }, X.close)],
+    });
+  }
+}
+
+const awardText = (award, c) => `${award.emoji} ${award.title}\n${award.line}\n\n${X.awardFooter(S.langName(c.target))}`;
 
 // ---------------------------------------------------------------- App-Zustand
 
@@ -629,6 +945,7 @@ function progress(c) {
   return {
     level,
     done: Store.doneLessons(c.target),
+    deep: Store.allStages(c.target),
     next: Store.nextLesson(c.target, level),
     review: Store.review(c.target),
     due: Store.dueItems(c.target, Infinity).length,
@@ -641,6 +958,7 @@ function render() {
   const c = Store.course;
   if (!c) { root.replaceChildren(onboarding()); return; }
   S = STRINGS[c.base];
+  X = EXTRAS[c.base];
   document.documentElement.lang = c.base;
   if (!app.exercises || app.exercises.courseId !== c.id) {
     app.exercises = Exercises(c);
@@ -652,6 +970,7 @@ function render() {
   const p = progress(c);
   if (s.name === 'grammar') root.replaceChildren(grammarDetail(c, s.lesson));
   else if (s.name === 'result') root.replaceChildren(resultScreen(c, s, p));
+  else if (s.name === 'vocab') root.replaceChildren(vocabSetup(c, s));
   else root.replaceChildren(home(c, p));
 }
 
@@ -720,6 +1039,39 @@ function startLesson(lesson) {
   go({ name: 'session', kind: 'lesson', lesson, steps: app.exercises.forLesson(lesson, canSpeak) });
 }
 
+function startStage(lesson, stage) {
+  if (stage === 1) startLesson(lesson);
+  else go({ name: 'session', kind: 'stage', lesson, stage, steps: app.exercises.forStage(lesson, stage, canSpeak) });
+}
+
+/** Geschaffte Übungen einer Lektion: 1 = Lektion, 2 und 3 = Vertiefungen. */
+function stagesOf(lesson, p) {
+  const done = new Set();
+  if (p.done.has(lesson.id)) done.add(1);
+  if (p.deep.has(lesson.id + '#2')) done.add(2);
+  if (p.deep.has(lesson.id + '#3')) done.add(3);
+  return done;
+}
+
+/** Kleines Fenster auf der Kachel: eine der drei Übungen der Lektion wählen. */
+function stagePopup(lesson, c, p) {
+  const done = stagesOf(lesson, p);
+  const closeIt = dialog({
+    title: lesson.title[c.base],
+    body: h('div', { class: 'stack-s' },
+      h('div', { class: 'body-m muted' }, X.pickExercise),
+      [1, 2, 3].map(stage => h('button', {
+        class: 'stage-option' + (done.has(stage) ? ' done' : ''),
+        onclick: () => { closeIt(); startStage(lesson, stage); },
+      },
+      h('div', { class: 'grow' },
+        h('div', { class: 'title-m' }, `${stage} · ${X.stageNames[stage - 1]}`),
+        h('div', { class: 'body-s muted' }, X.stageHints[stage - 1])),
+      done.has(stage) && h('span', { style: 'color:var(--tertiary);display:flex' }, icon('check'))))),
+    actions: close => [h('button', { class: 'text-btn', onclick: close }, S.cancel)],
+  });
+}
+
 function courseTab(c, p) {
   const level = p.level;
   const levelLessons = lessonsOfLevel(level);
@@ -746,7 +1098,7 @@ function courseTab(c, p) {
       h('div', { class: 'grow' },
         h('div', { class: 'body-l muted' }, S.greeting),
         h('h1', { class: 'h1' }, S.langName(c.target))),
-      streakChip(p.streak)),
+      streakChip(p.streak, () => goalDialog())),
     c.levels.length > 1 && h('div', { class: 'chip-row', style: 'margin-top:16px' }, c.levels.map(lv => {
       const finished = lessonsOfLevel(lv).every(l => p.done.has(l.id));
       return h('button', { class: 'chip' + (lv === level ? ' active' : ''), onclick: () => { Store.setLevel(c.target, lv); render(); } },
@@ -761,7 +1113,12 @@ function courseTab(c, p) {
           h('span', {}, `${done}/${chapter.lessons.length}`)),
         chapter.lessons.map((lesson, li) => {
           const isDone = p.done.has(lesson.id), current = lesson === next;
-          return h('button', { class: 'card-m lesson' + (current ? ' selected' : ''), onclick: () => startLesson(lesson) },
+          // Grün füllt sich drittelweise: je eine der drei Übungen der Lektion.
+          const part = stagesOf(lesson, p).size * 100 / 3;
+          return h('button', {
+            class: 'card-m lesson' + (current ? ' selected' : ''), onclick: () => stagePopup(lesson, c, p),
+            style: part ? `background-image:linear-gradient(to right, var(--tertiary-fill) ${part}%, transparent ${part}%)` : null,
+          },
             h('div', { class: 'dot' + (isDone ? ' done' : current ? ' current' : '') }, isDone ? icon('check') : String(li + 1)),
             h('div', { class: 'grow' },
               h('div', { class: 'title-m' }, lesson.title[c.base]),
@@ -771,8 +1128,50 @@ function courseTab(c, p) {
     }));
 }
 
-function streakChip(days) {
-  return h('div', { class: 'streak' }, icon('flame'), String(days));
+function streakChip(days, onclick) {
+  return h('button', { class: 'streak', 'aria-label': X.goal, onclick }, icon('flame'), String(days));
+}
+
+function choiceChips(options, selected, label, onPick) {
+  return h('div', { class: 'choice-chips' }, options.map(o =>
+    h('button', { class: 'chip' + (o === selected ? ' active' : ''), onclick: () => onPick(o) }, label(o))));
+}
+
+/** Beim Tippen auf die Flamme: Tagesziel und Wette. Erinnerungen gibt es nur in der Android-App. */
+function goalDialog() {
+  let perDay = Store.goalPerDay, days = Store.goalDays;
+  const stake = h('input', { class: 'text-field small', type: 'text', placeholder: X.betStakeHint, 'aria-label': X.betStake, value: Store.goalStake });
+  const body = h('div', { class: 'stack-s' });
+  function paint() {
+    body.replaceChildren(...[
+      Store.goalPerDay > 0 && h('div', { class: 'title-m', style: 'color:var(--primary)' }, X.goalToday(Store.todayCount, Store.goalPerDay)),
+      Store.goalPerDay > 0 && h('div', { class: 'body-m muted' }, X.goalRun(Store.goalStreak, Store.goalDays)),
+      h('div', { class: 'title-s' }, X.goalPerDay),
+      choiceChips([0, 1, 2, 3, 5], perDay, n => n === 0 ? X.goalOff : n, n => { perDay = n; paint(); }),
+      perDay > 0 && h('div', { class: 'title-s' }, X.goalDays),
+      perDay > 0 && choiceChips([7, 14, 30], days, n => n, n => { days = n; paint(); }),
+      perDay > 0 && h('div', { class: 'label', style: 'margin-top:16px' }, X.bet),
+      perDay > 0 && h('div', { class: 'title-s' }, X.betStake),
+      perDay > 0 && stake,
+      perDay > 0 && h('button', {
+        class: 'btn outline', onclick: () => {
+          const won = perDay === Store.goalPerDay && days === Store.goalDays && Store.goalStreak >= days;
+          Store.setGoal(perDay, days, stake.value);
+          shareText(won ? X.betWon(days, stake.value) : X.betText(perDay, days, stake.value));
+          paint();
+        },
+      }, X.betSend),
+    ].filter(Boolean));
+  }
+  paint();
+  dialog({
+    title: X.goal,
+    body,
+    actions: close => [
+      h('button', { class: 'text-btn', onclick: close }, S.cancel),
+      h('button', { class: 'text-btn', onclick: () => { Store.setGoal(perDay, days, stake.value); close(); render(); } }, X.save),
+    ],
+  });
 }
 
 function reviewTab(c, p) {
@@ -800,7 +1199,7 @@ function reviewTab(c, p) {
     h('h1', { class: 'h1' }, S.review),
     h('div', { class: 'card pad-l center-col' }, main),
     h('div', { class: 'label', style: 'margin-top:24px' }, S.training),
-    trainingCard(S.vocabTraining, S.vocabTrainingHint, () => chooseVocabModes(c, p)),
+    trainingCard(S.vocabTraining, S.vocabTrainingHint, () => go({ name: 'vocab', level: p.level, topics: new Set(), modes: new Set(Store.vocabModes) })),
     h('div', { style: 'margin-top:8px' }, trainingCard(S.grammarTraining, S.grammarTrainingHint, () =>
       go({ name: 'session', kind: 'training', steps: app.exercises.forGrammar(trainingLessons(c, p)) }))),
     count > 0 && [
@@ -822,34 +1221,52 @@ function trainingCard(title, hint, onclick) {
     h('div', { style: 'padding:16px' }, h('div', { class: 'title-m' }, title), h('div', { class: 'body-s muted' }, hint)));
 }
 
-function chooseVocabModes(c, p) {
-  const selected = new Set(Store.vocabModes);
-  let startBtn;
-  const rows = VOCAB_MODES.map(mode => {
-    const box = h('span', { class: 'box' });
-    const paint = () => { box.className = 'box' + (selected.has(mode) ? ' on' : ''); box.replaceChildren(selected.has(mode) ? icon('check') : ''); };
-    paint();
-    return h('button', {
-      class: 'check-row', role: 'checkbox',
-      onclick: () => { selected.has(mode) ? selected.delete(mode) : selected.add(mode); paint(); startBtn.disabled = !selected.size; },
-    }, box, S.modeName(mode));
-  });
-  dialog({
-    title: S.chooseModes,
-    body: h('div', {}, rows),
-    actions: close => [
-      h('button', { class: 'text-btn', onclick: close }, S.cancel),
-      startBtn = h('button', {
-        class: 'text-btn', onclick: () => {
-          close();
-          const modes = VOCAB_MODES.filter(m => selected.has(m));
-          Store.vocabModes = modes;
-          const words = shuffled(trainingLessons(c, p).flatMap(l => l.words)).slice(0, 15);
-          go({ name: 'session', kind: 'training', steps: app.exercises.forVocabulary(words, modes, canSpeak) });
+/** Vokabeln üben: Stufe und Themen wählen, dann Übungen oder Karteikarten. */
+function vocabSetup(c, s) {
+  const update = () => {
+    const y = document.querySelector('.step-body')?.scrollTop || 0;
+    render();
+    const body = document.querySelector('.step-body');
+    if (body) body.scrollTop = y;
+  };
+  // Leere Themenauswahl = alle Themen.
+  const chapters = s.level.chapters.filter((_, i) => !s.topics.size || s.topics.has(i));
+  const words = chapters.flatMap(ch => ch.lessons).flatMap(l => l.words);
+  const topicRow = (title, selected, onclick) => h('button', { class: 'card-m topic' + (selected ? ' selected' : ''), onclick },
+    h('span', { class: 'grow title-s' }, title), selected && h('span', { style: 'color:var(--primary);display:flex' }, icon('check')));
+  const modes = VOCAB_MODES.map(mode => h('button', {
+    class: 'check-row', role: 'checkbox', 'aria-checked': String(s.modes.has(mode)),
+    onclick: () => { s.modes.has(mode) ? s.modes.delete(mode) : s.modes.add(mode); update(); },
+  }, h('span', { class: 'box' + (s.modes.has(mode) ? ' on' : '') }, s.modes.has(mode) && icon('check')), S.modeName(mode)));
+  return h('div', { class: 'screen' },
+    h('div', { class: 'back-bar' },
+      h('button', { class: 'icon-btn', style: 'color:var(--on-surface)', 'aria-label': 'Zurück', onclick: () => go({ name: 'home' }) }, icon('back')),
+      h('span', { class: 'title-l ellipsis' }, X.vocabSetup)),
+    h('div', { class: 'step-body' },
+      h('div', { class: 'label' }, X.levelLabel),
+      choiceChips(c.levels, s.level, l => l.name, l => { s.level = l; s.topics = new Set(); update(); }),
+      h('div', { class: 'label' }, X.topics),
+      h('div', { class: 'stack-s' },
+        topicRow(X.allTopics, !s.topics.size, () => { s.topics = new Set(); update(); }),
+        s.level.chapters.map((ch, i) => topicRow(ch.title[c.base], s.topics.has(i), () => {
+          s.topics.has(i) ? s.topics.delete(i) : s.topics.add(i);
+          update();
+        }))),
+      h('div', { class: 'label' }, X.howToPractise),
+      h('div', {}, modes)),
+    h('div', { class: 'bottom stack-s' },
+      h('div', { class: 'body-m muted' }, X.wordsCount(words.length)),
+      h('button', {
+        class: 'btn', disabled: !words.length || !s.modes.size, onclick: () => {
+          const list = VOCAB_MODES.filter(m => s.modes.has(m));
+          Store.vocabModes = list;
+          go({ name: 'session', kind: 'training', steps: app.exercises.forVocabulary(shuffled(words).slice(0, 15), list, canSpeak) });
         },
-      }, S.start),
-    ],
-  });
+      }, X.modeExercises),
+      h('button', {
+        class: 'btn outline', disabled: !words.length,
+        onclick: () => go({ name: 'session', kind: 'training', steps: app.exercises.forCards(words) }),
+      }, X.modeCards)));
 }
 
 function grammarTab(c, p) {
@@ -859,6 +1276,15 @@ function grammarTab(c, p) {
     h('div', { class: 'body-m muted' }, S.grammarHint),
     c.levels.length > 1 && h('div', { class: 'chip-row', style: 'margin-top:12px' }, c.levels.map(lv =>
       h('button', { class: 'chip' + (lv === level ? ' active' : ''), onclick: () => { app.grammarLevel = lv.name; render(); } }, lv.name))),
+    h('div', { class: 'label', style: 'margin-top:24px' }, X.sounds),
+    h('div', { class: 'body-s muted', style: 'margin-bottom:8px' }, X.soundsHint),
+    CONTENT.sounds[c.target].map(group => practiceRow(group.title[c.base], () =>
+      go({ name: 'session', kind: 'training', steps: app.exercises.forSounds(group, canSpeak) }))),
+    h('div', { class: 'label', style: 'margin-top:24px' }, X.drills),
+    h('div', { class: 'body-s muted', style: 'margin-bottom:8px' }, X.drillsHint),
+    CONTENT.drills[c.target].map(drill => practiceRow(drill.title[c.base], () =>
+      go({ name: 'session', kind: 'training', steps: app.exercises.forDrill(drill) }))),
+    h('div', { class: 'label', style: 'margin-top:24px' }, X.reference),
     level.chapters.map((chapter, ci) => [
       h('div', { class: 'label', style: 'padding:24px 0 8px' }, `${S.chapter(ci + 1).toUpperCase()} · ${chapter.title[c.base]}`),
       chapter.lessons.filter(l => l.tips[c.id]).map(lesson => h('button', {
@@ -871,6 +1297,22 @@ function grammarTab(c, p) {
     ]));
 }
 
+const practiceRow = (title, onclick) => h('button', { class: 'card-m lesson', onclick }, h('div', { class: 'grow title-m' }, title));
+
+/** Alle geschafften Units des Kurses als Auszeichnungen; Antippen sendet sie. */
+function awardList(c, p) {
+  const earned = c.levels.flatMap(level => level.chapters
+    .filter(ch => ch.lessons.every(l => p.done.has(l.id)))
+    .map(ch => awardOf(c, level, ch)));
+  return [
+    h('div', { class: 'label', style: 'margin-top:24px' }, X.awards),
+    !earned.length && h('div', { class: 'body-m muted' }, X.awardsEmpty),
+    earned.map(award => h('button', { class: 'card-m lesson', onclick: () => shareText(awardText(award, c)) },
+      h('div', { class: 'award-emoji' }, award.emoji),
+      h('div', { class: 'grow' }, h('div', { class: 'title-s' }, award.title), h('div', { class: 'body-s muted' }, award.line)))),
+  ];
+}
+
 function profileTab(c, p) {
   const all = c.levels.reduce((n, l) => n + lessonsOfLevel(l).length, 0);
   return h('div', { class: 'scroll stack' },
@@ -879,6 +1321,7 @@ function profileTab(c, p) {
       stat(p.streak, S.streak), stat(Object.keys(p.review).length, S.items), stat(`${p.done.size}/${all}`, S.lessons)),
     Speaker.voiceMissing && h('div', { class: 'notice' }, S.noVoice(c.target)),
     !isStandalone() && h('div', { class: 'info muted' }, S.install),
+    awardList(c, p),
     h('div', { class: 'label', style: 'margin-top:24px' }, S.courses),
     allCourses().map(o => courseCard(o, o.id === c.id, () => {
       if (o.id !== c.id) { app.tab = 0; app.grammarLevel = null; Store.course = o; render(); }
@@ -1028,8 +1471,16 @@ function finish(c, s) {
   const graded = s.steps.filter(isExercise).length - s.skipped;
   const result = { graded, firstTry: s.firstTry, items: s.results };
   if (s.kind === 'lesson') {
+    const level = levelOf(c.target, s.lesson);
+    const chapter = level.chapters.find(ch => ch.lessons.includes(s.lesson));
+    const done = Store.doneLessons(c.target);
+    // Auszeichnung nur beim ersten Abschluss der Unit, nicht beim Wiederholen.
+    const finishesUnit = !done.has(s.lesson.id) && chapter.lessons.every(l => l === s.lesson || done.has(l.id));
     Store.completeLesson(c.target, s.lesson);
-    go({ name: 'result', kind: s.kind, result, items: itemsOf(s.lesson) });
+    go({ name: 'result', kind: s.kind, result, items: itemsOf(s.lesson), award: finishesUnit ? awardOf(c, level, chapter) : null });
+  } else if (s.kind === 'stage') {
+    Store.completeStage(c.target, s.lesson.id, s.stage);
+    go({ name: 'result', kind: s.kind, result, items: Object.keys(s.results).map(id => index(c.target).items.get(id)).filter(Boolean) });
   } else {
     // Freiwilliges Üben und Training zählen für die Serie, verschieben aber keine Termine.
     Store.completeReview(c.target, s.results, s.kind !== 'review');
@@ -1051,6 +1502,9 @@ function stepView(step, c, s, done) {
     case 'spell': return spellStep(step, c, finished);
     case 'build': return buildStep(step, c, finished);
     case 'gap': return gapStep(step, c, finished);
+    case 'cloze': return clozeStep(step, c, finished);
+    case 'sort': return sortStep(step, c, finished);
+    case 'card': return cardStep(step, c, finished);
   }
 }
 
@@ -1068,11 +1522,26 @@ function frame(prompt, content, controls, bottom) {
 const bottomButton = (label, onclick, disabled) =>
   h('div', { class: 'bottom' }, h('button', { class: 'btn', onclick, disabled }, label));
 
-function feedbackBar(perfect, title, solution, translation, onNext) {
+/** "Warum?" nach einem Fehler: die Regel der Lektion in Kurzform, auf Wunsch ganz. */
+function whyBox(tip) {
+  return h('div', { class: 'why' },
+    h('div', { class: 'title-s' }, `${X.why} ${tip.title}`),
+    h('div', { class: 'body-m muted why-body' }, tip.body),
+    h('button', {
+      class: 'text-btn', onclick: () => dialog({
+        title: X.why,
+        body: grammarCard(tip),
+        actions: close => [h('button', { class: 'text-btn', onclick: close }, X.close)],
+      }),
+    }, X.fullRule));
+}
+
+function feedbackBar(perfect, title, solution, translation, onNext, why) {
   return h('div', { class: 'feedback' + (perfect ? ' ok' : '') },
     h('div', { class: 'fb-title' }, title),
-    h('div', { class: 'title-m' }, solution),
-    h('div', { class: 'body-m muted' }, translation),
+    solution && h('div', { class: 'title-m' }, solution),
+    translation && h('div', { class: 'body-m muted' }, translation),
+    why && whyBox(why),
     h('button', { class: 'btn' + (perfect ? ' green' : ''), onclick: onNext }, S.next));
 }
 
@@ -1145,7 +1614,20 @@ function typeStep(step, c, finished) {
     onkeydown: e => { if (e.key === 'Enter') { e.preventDefault(); check(); } },
   });
   const btn = h('button', { class: 'btn', disabled: true, onclick: () => check() }, S.check);
-  const el = frame(S.promptType(c.target), [h('div', { class: 'h1' }, step.prompt), input], null, h('div', { class: 'bottom' }, btn));
+  // Tipp: verrät Buchstabe für Buchstabe den Anfang, der Rest bleibt verdeckt.
+  let hints = 0;
+  const chars = Array.from(step.answer);
+  const hintText = h('span', { class: 'title-m hint-text' });
+  const hintRow = h('div', { class: 'row' },
+    h('button', {
+      class: 'text-btn', onclick: () => {
+        if (hints < chars.length) hints++;
+        hintText.textContent = chars.map((ch, i) => i < hints || ch === ' ' ? ch : '_').join(' ');
+        input.focus();
+      },
+    }, X.hint),
+    hintText);
+  const el = frame(S.promptType(c.target), [h('div', { class: 'h1' }, step.prompt), input, hintRow], null, h('div', { class: 'bottom' }, btn));
   function check() {
     if (checked || !input.value.trim()) return;
     const want = normalize(step.answer), got = normalize(input.value);
@@ -1155,8 +1637,9 @@ function typeStep(step, c, finished) {
     input.readOnly = true;
     Speaker.speak(step.answer);
     input.blur();
+    hintRow.remove();
     el.setBottom(feedbackBar(correct, accentsOff ? S.accentHint : correct ? S.correct : S.correctAnswerIs,
-      step.answer, step.prompt, () => finished(!correct)));
+      step.answer, step.prompt, () => finished(!correct), !correct && step.why));
   }
   return el;
 }
@@ -1165,7 +1648,7 @@ function typeStep(step, c, finished) {
  * Kachel-Übungen: Kacheln in der richtigen Reihenfolge antippen; eine falsche leuchtet kurz rot
  * und zählt als Fehler. onPlaced zeichnet die Antwortzeile neu.
  */
-function tileStep({ prompt, tiles, target, spoken, translation, header, onPlaced, finished }) {
+function tileStep({ prompt, tiles, target, spoken, translation, header, onPlaced, finished, why }) {
   let placed = 0, mistakes = false;
   const el = frame(prompt, header, h('div', { class: 'tiles' }, tiles.map(t => {
     const tile = h('button', {
@@ -1178,7 +1661,7 @@ function tileStep({ prompt, tiles, target, spoken, translation, header, onPlaced
           onPlaced(placed);
           if (placed === target.length) {
             Speaker.speak(spoken);
-            el.setBottom(feedbackBar(!mistakes, mistakes ? S.withMistakes : S.correct, spoken, translation, () => finished(mistakes)));
+            el.setBottom(feedbackBar(!mistakes, mistakes ? S.withMistakes : S.correct, spoken, translation, () => finished(mistakes), mistakes && why));
           }
         } else {
           mistakes = true;
@@ -1213,7 +1696,7 @@ function buildStep(step, c, finished) {
   const draw = n => line.replaceChildren(...step.target.slice(0, n).map(w => h('span', {}, w)));
   return tileStep({
     prompt: S.promptBuild(c.target), tiles: step.tiles, target: step.target, spoken: step.sentence,
-    translation: text(step.item, c.base), onPlaced: draw, finished,
+    translation: text(step.item, c.base), onPlaced: draw, finished, why: step.why,
     header: [h('div', { class: 'h2' }, text(step.item, c.base)), line],
   });
 }
@@ -1222,9 +1705,187 @@ function gapStep(step, c, finished) {
   const sentence = h('div', { class: 'h2' }, step.gapped);
   return tileStep({
     prompt: S.promptGap, tiles: step.options, target: [step.answer], spoken: step.sentence,
-    translation: text(step.item, c.base), onPlaced: () => { sentence.textContent = step.sentence; }, finished,
+    translation: text(step.item, c.base), onPlaced: () => { sentence.textContent = step.sentence; }, finished, why: step.why,
     header: [h('div', { class: 'card pad stack-s' }, sentence, h('div', { class: 'body-l muted' }, text(step.item, c.base)))],
   });
+}
+
+/** Kachel lässt sich mit dem Finger verschieben; onDrop bekommt die Mitte beim Loslassen. Ein Tipp bleibt ein Klick. */
+function draggable(tile, onTap, onDrop) {
+  let start = null, moved = false, ignoreClick = false;
+  const reset = () => { start = null; tile.style.transform = ''; tile.classList.remove('dragging'); };
+  tile.addEventListener('click', () => { if (!ignoreClick) onTap(); });
+  // Sonst startet die Maus bei markiertem Text das Ziehen des Browsers und bricht unseres ab.
+  tile.addEventListener('dragstart', e => e.preventDefault());
+  tile.addEventListener('pointerdown', e => {
+    start = { x: e.clientX, y: e.clientY };
+    moved = false;
+    tile.setPointerCapture?.(e.pointerId);
+  });
+  tile.addEventListener('pointermove', e => {
+    if (!start) return;
+    const dx = e.clientX - start.x, dy = e.clientY - start.y;
+    if (!moved && Math.hypot(dx, dy) < 6) return;
+    moved = true;
+    tile.classList.add('dragging');
+    tile.style.transform = `translate(${dx}px, ${dy}px)`;
+  });
+  tile.addEventListener('pointerup', () => {
+    if (!start) return;
+    if (moved) {
+      const r = tile.getBoundingClientRect();
+      ignoreClick = true;
+      setTimeout(() => { ignoreClick = false; }, 50);
+      reset();
+      onDrop(r.left + r.width / 2, r.top + r.height / 2);
+    } else reset();
+  });
+  tile.addEventListener('pointercancel', reset);
+}
+
+/**
+ * Lückentext: Wörter mit dem Finger in die Lücken ziehen (oder antippen, dann füllen sie die
+ * nächste freie Lücke). Beim Prüfen bleiben richtige Wörter liegen, falsche gehen zurück.
+ */
+function clozeStep(step, c, finished) {
+  const filled = new Map(); // Lücke → Index des Wortes in der Auswahl
+  const locked = new Set();
+  const slots = [];
+  let mistakes = false;
+
+  const lines = step.lines.map(line => h('div', { class: 'cloze-line' }, line.split(' ').map(word => {
+    const at = word.indexOf(GAP);
+    if (at < 0) return h('span', {}, word);
+    const i = slots.length;
+    const slot = h('button', {
+      class: 'slot', onclick: () => {
+        if (filled.has(i) && !locked.has(i)) { filled.delete(i); paint(); }
+      },
+    });
+    slots.push(slot);
+    const before = word.slice(0, at), after = word.slice(at + GAP.length);
+    return [before && h('span', {}, before), slot, after && h('span', {}, after)];
+  })));
+
+  const inUse = chip => [...filled.values()].includes(chip);
+
+  function place(chip, slot) {
+    const free = slot ?? step.answers.findIndex((_, i) => !filled.has(i));
+    if (free < 0 || locked.has(free) || inUse(chip)) return;
+    filled.set(free, chip);
+    paint();
+  }
+
+  const chips = step.bank.map((word, i) => {
+    const chip = h('button', { class: 'tile drag' }, word);
+    draggable(chip, () => place(i, null), (x, y) => {
+      const hit = slots.findIndex(s => {
+        const r = s.getBoundingClientRect();
+        return x >= r.left - 16 && x <= r.right + 16 && y >= r.top - 16 && y <= r.bottom + 16;
+      });
+      if (hit >= 0) place(i, hit);
+    });
+    return chip;
+  });
+
+  const btn = h('button', { class: 'btn', onclick: () => check() }, S.check);
+  const el = frame(X.promptCloze, lines, h('div', { class: 'tiles' }, chips), h('div', { class: 'bottom' }, btn));
+
+  function paint() {
+    slots.forEach((s, i) => {
+      s.textContent = filled.has(i) ? step.bank[filled.get(i)] : '\u00a0';
+      s.classList.toggle('locked', locked.has(i));
+    });
+    chips.forEach((chip, i) => {
+      chip.disabled = inUse(i);
+      chip.classList.toggle('used', inUse(i));
+    });
+    btn.disabled = filled.size !== step.answers.length;
+  }
+
+  function check() {
+    const wrong = [];
+    for (const [slot, chip] of filled) {
+      if (step.bank[chip].toLowerCase() === step.answers[slot].toLowerCase()) locked.add(slot);
+      else wrong.push(slot);
+    }
+    if (wrong.length) {
+      mistakes = true;
+      vibrate();
+      wrong.forEach(slot => filled.delete(slot));
+    }
+    paint();
+    if (locked.size === step.answers.length) {
+      el.querySelector('.controls').remove();
+      el.setBottom(feedbackBar(!mistakes, mistakes ? S.withMistakes : S.correct, '',
+        step.lines.length === 1 ? text(step.item, c.base) : '', () => finished(mistakes), mistakes && step.why));
+    }
+  }
+
+  paint();
+  return el;
+}
+
+/** Sätze nacheinander der richtigen Zeitform zuordnen. */
+function sortStep(step, c, finished) {
+  let i = 0, mistakes = false;
+  const prompt = h('span', {});
+  const audioSlot = h('span', { style: 'display:flex' });
+  const sentence = h('div', { class: 'h2 grow' });
+  const options = step.categories.map(category => {
+    const btn = h('button', {
+      class: 'option', onclick: () => {
+        if (i >= step.entries.length) return;
+        if (category === step.entries[i][1]) {
+          i++;
+          paint();
+        } else {
+          mistakes = true;
+          vibrate();
+          btn.classList.add('wrong');
+          setTimeout(() => btn.classList.remove('wrong'), 450);
+        }
+      },
+    }, category);
+    return btn;
+  });
+  const el = frame(prompt, [h('div', { class: 'card pad row', style: 'min-height:120px;gap:12px' }, audioSlot, sentence)], options, null);
+  function paint() {
+    prompt.textContent = `${X.promptSort} (${Math.min(i + 1, step.entries.length)}/${step.entries.length})`;
+    const current = step.entries[i];
+    audioSlot.replaceChildren(...(current ? [audioButton(current[0])] : []));
+    sentence.textContent = current ? current[0] : text(step.item, c.base);
+    if (!current) {
+      el.querySelector('.controls').remove();
+      el.setBottom(feedbackBar(!mistakes, mistakes ? S.withMistakes : S.correct, '', '', () => finished(mistakes), mistakes && step.why));
+    }
+  }
+  paint();
+  return el;
+}
+
+/** Karteikarte: vorne Zielsprache, hinten Bedeutung; umdrehen und selbst einschätzen. */
+function cardStep(step, c, finished) {
+  const front = text(step.item, c.target);
+  let flipped = false;
+  const again = h('button', { class: 'btn outline', disabled: true, onclick: () => finished(true) }, X.cardAgain);
+  const knew = h('button', { class: 'btn', disabled: true, onclick: () => finished(false) }, X.cardKnew);
+  const card = h('button', {
+    class: 'flash-card', 'aria-label': X.cardFlip, onclick: () => {
+      flipped = !flipped;
+      card.classList.toggle('flipped', flipped);
+      if (flipped) {
+        Speaker.speak(front);
+        again.disabled = knew.disabled = false;
+      }
+    },
+  },
+  h('span', { class: 'face front' }, h('span', { class: 'h1' }, front), h('span', { class: 'body-s muted' }, X.cardFlip)),
+  h('span', { class: 'face back' }, h('span', { class: 'h1' }, text(step.item, c.base))));
+  return h('div', { class: 'step card-step' },
+    h('div', { class: 'prompt' }, X.promptCard),
+    card,
+    h('div', { class: 'card-actions' }, again, knew));
 }
 
 /** Anteil der Zielwörter, die in der Erkennung vorkommen (0..1). */
@@ -1284,7 +1945,7 @@ function speakStep(step, c, finished) {
 // ---------------------------------------------------------------- Ergebnis
 
 function resultScreen(c, s, p) {
-  const title = s.kind === 'lesson' ? S.lessonDone : s.kind === 'training' ? S.trainingDone : S.reviewDone;
+  const title = s.kind === 'lesson' ? S.lessonDone : s.kind === 'stage' ? X.stageDone : s.kind === 'training' ? S.trainingDone : S.reviewDone;
   const r = s.result;
   const percent = r.graded === 0 ? 100 : Math.floor(r.firstTry * 100 / r.graded);
   return h('div', { class: 'screen' },
@@ -1292,6 +1953,12 @@ function resultScreen(c, s, p) {
       h('div', { class: 'result-check' }, icon('check')),
       h('h1', { class: 'h1 center' }, title),
       h('div', { class: 'stats' }, stat(`${percent} %`, S.accuracy), stat(p.streak, S.streak)),
+      s.award && h('div', { class: 'award-card' },
+        h('div', { class: 'label' }, X.awardNew),
+        h('div', { class: 'award-big' }, s.award.emoji),
+        h('div', { class: 'title-l' }, s.award.title),
+        h('div', { class: 'body-m muted' }, s.award.line),
+        h('button', { class: 'btn', onclick: () => shareText(awardText(s.award, c)) }, X.awardShare)),
       s.items.length > 0 && [
         h('div', { class: 'label', style: 'margin-top:24px' }, s.kind === 'lesson' ? S.newVocabulary : S.reviewedItems),
         h('div', { class: 'card-m', style: 'margin-top:8px' }, s.items.map(item => h('div', { class: 'item-row' },

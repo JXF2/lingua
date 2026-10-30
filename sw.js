@@ -1,5 +1,5 @@
 // Offline-Betrieb: erst Netz (damit Updates sofort ankommen), sonst die gespeicherte Kopie.
-const CACHE = 'lingua-v1';
+const CACHE = 'lingua-v2';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'content.json', 'manifest.webmanifest', 'icons/apple-touch-icon.png', 'icons/icon-192.png'];
 
 self.addEventListener('install', e => {
