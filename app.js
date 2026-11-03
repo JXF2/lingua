@@ -51,11 +51,18 @@ const GAP = '_____';
 const FOCUS = /\[([^\]|]+)((?:\|[^\]|]+)*)\]/;
 const FOCUS_ALL = new RegExp(FOCUS.source, 'g');
 
+/** Trennt weitere richtige Fassungen: "I have never seen … // Never have I seen …". Die erste ist die Hauptfassung. */
+const ALT = ' // ';
+const raw = (item, lang) => item.t[lang].split(ALT)[0];
+
 /** Text ohne Lücken-Markierung: "[viennes|viens]" → "viennes". */
-const text = (item, lang) => item.t[lang].replace(FOCUS_ALL, (_, a) => a);
+const text = (item, lang) => raw(item, lang).replace(FOCUS_ALL, (_, a) => a);
+
+/** Alle Fassungen, die beim Schreiben als richtig gelten (die Hauptfassung zuerst). */
+const accepted = (item, lang) => item.t[lang].split(ALT).map(v => v.trim().replace(FOCUS_ALL, (_, a) => a));
 
 function focus(item, lang) {
-  const raw = item.t[lang];
+  const raw = item.t[lang].split(ALT)[0];
   const m = FOCUS.exec(raw);
   if (!m) return null;
   const gapped = raw.slice(0, m.index) + GAP + raw.slice(m.index + m[0].length);
@@ -82,6 +89,104 @@ function withGap(sentence, i) {
   return parts.join(' ');
 }
 
+// ---------------------------------------------------------------- Antworten prüfen (wie Answers.kt)
+
+/**
+ * Prüft getippte Antworten großzügig: Groß/Klein, Satzzeichen, Auslassungspunkte, fehlende Akzente,
+ * englische Kurzformen (I've = I have) und kleine Tippfehler gelten als richtig. Mehrere richtige
+ * Fassungen sind möglich. Nur die Wörter in strict (die geübte Grammatikform) müssen bis auf
+ * Akzente genau stimmen. Ergebnis: { verdict: 'exact'|'accents'|'typo'|'wrong', match }.
+ */
+const Answers = (() => {
+  const RANK = { exact: 0, accents: 1, typo: 2, wrong: 3 };
+  const SHORT = [
+    ["won't", 'will not'], ["can't", 'cannot'], ["shan't", 'shall not'], ["n't", ' not'],
+    ["i'm", 'i am'], ["'re", ' are'], ["'ve", ' have'], ["'ll", ' will'], ["'d", ' would'],
+    ["let's", 'let us'], ["it's", 'it is'], ["that's", 'that is'], ["there's", 'there is'],
+    ["he's", 'he is'], ["she's", 'she is'], ["what's", 'what is'], ["where's", 'where is'],
+  ];
+
+  function expand(t) {
+    for (const [s, l] of SHORT) t = t.split(s).join(l);
+    return t.split('cannot').join('can not');
+  }
+
+  /** Wörter in Vergleichsform: klein, ohne Satzzeichen und Auslassungspunkte, Kurzformen ausgeschrieben. */
+  function words(t, lang) {
+    t = t.toLowerCase().replace(/[’‘`]/g, "'").replace(/…/g, ' ').replace(/\.{2,}/g, ' ')
+      .replace(/[,.;:!?¿¡«»"„“”()[\]–—/]/g, ' ');
+    if (lang === 'en') t = expand(t);
+    return t.split(/\s+/).map(w => w.replace(/^['-]+|['-]+$/g, '')).filter(Boolean);
+  }
+
+  /** Ohne Akzente und Apostrophe (j'ai = jai), mit ß = ss. */
+  const plain = w => w.normalize('NFD').replace(/\p{M}/gu, '').replace(/œ/g, 'oe').replace(/æ/g, 'ae').replace(/ß/g, 'ss').replace(/'/g, '');
+
+  /** Editierabstand mit Vertauschung zweier Nachbarbuchstaben als ein Fehler. */
+  function distance(a, b) {
+    const d = Array.from({ length: a.length + 1 }, (_, i) => { const r = new Array(b.length + 1).fill(0); r[0] = i; return r; });
+    for (let j = 0; j <= b.length; j++) d[0][j] = j;
+    for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+    }
+    return d[a.length][b.length];
+  }
+
+  /** Kurze Wörter müssen stimmen ("is" / "it"), längere dürfen einen, sehr lange zwei Fehler haben. */
+  function smallTypo(a, b) {
+    const allowed = b.length < 4 ? 0 : b.length < 9 ? 1 : 2;
+    return allowed > 0 && distance(a, b) <= allowed;
+  }
+
+  /** Getrennt oder zusammen geschrieben ("everyday" / "every day"): ganze Zeichenkette vergleichen. */
+  function closeJoined(got, want, strict) {
+    if (want.some(w => strict.has(plain(w)))) return false;
+    const a = got.map(plain).join(''), b = want.map(plain).join('');
+    return b.length >= 6 && distance(a, b) <= 1;
+  }
+
+  /** Gleich viele Wörter, und die abweichenden sind nur leicht vertippt (höchstens jedes dritte Wort). */
+  function closeEnough(got, want, strict) {
+    if (got.length !== want.length || !want.length) return closeJoined(got, want, strict);
+    let typos = 0;
+    for (let i = 0; i < want.length; i++) {
+      const a = plain(got[i]), b = plain(want[i]);
+      if (a === b) continue;
+      if (strict.has(b) || !smallTypo(a, b)) return false;
+      typos++;
+    }
+    return typos <= Math.max(1, Math.floor(want.length / 3));
+  }
+
+  const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+  function grade(input, acceptedList, lang, strict = []) {
+    const got = words(input, lang);
+    const strictWords = new Set(strict.flatMap(s => words(s, lang)).map(plain));
+    let best = null;
+    for (const variant of acceptedList) {
+      const want = words(variant, lang);
+      const verdict = same(got, want) ? 'exact'
+        : same(got.map(plain), want.map(plain)) ? 'accents'
+        : closeEnough(got, want, strictWords) ? 'typo' : 'wrong';
+      if (!best || RANK[verdict] < RANK[best.verdict]) best = { verdict, match: variant };
+    }
+    // Falsch: die Fassung zeigen, der die Eingabe am nächsten kam.
+    if (best && best.verdict === 'wrong' && acceptedList.length > 1) {
+      const typed = got.map(plain).join(' ');
+      const dist = v => distance(typed, words(v, lang).map(plain).join(' '));
+      return { verdict: 'wrong', match: acceptedList.reduce((a, b) => dist(b) < dist(a) ? b : a) };
+    }
+    return best || { verdict: 'wrong', match: acceptedList[0] || '' };
+  }
+
+  return { grade, words, distance };
+})();
+
+const gradeTitle = g => ({ exact: S.correct, accents: S.accentHint, typo: X.typoHint, wrong: S.correctAnswerIs })[g.verdict];
+
 // ---------------------------------------------------------------- Zufall
 
 const shuffled = list => {
@@ -99,7 +204,7 @@ const distinctBy = (list, key) => { const seen = new Set(); return list.filter(x
 // ---------------------------------------------------------------- Übungen (wie Exercises.kt)
 
 const VOCAB_MODES = ['Meaning', 'Reverse', 'Listening', 'Spell', 'Type', 'Speak'];
-const EXERCISE = new Set(['choice', 'type', 'spell', 'build', 'gap', 'cloze', 'sort', 'card']);
+const EXERCISE = new Set(['choice', 'type', 'spell', 'build', 'gap', 'cloze', 'sort', 'card', 'talk']);
 const isExercise = step => EXERCISE.has(step.type);
 
 /** Passende Zuordnungs-Übung für eine Lektion, deren Tipp von dieser Zeitform handelt (wie Drills.sortFor). */
@@ -137,7 +242,7 @@ function Exercises(c) {
     return { type: 'choice', item, mode, prompt, options: shuffled(options), answer };
   }
 
-  const type = item => ({ type: 'type', item, prompt: meaning(item), answer: tx(item), why: null });
+  const type = item => ({ type: 'type', item, prompt: meaning(item), answer: tx(item), why: null, accepted: accepted(item, target), strict: [] });
 
   function spell(item) {
     const word = tx(item);
@@ -191,7 +296,32 @@ function Exercises(c) {
     return { type: 'cloze', item: sentences[0], lines: parts.map(p => p[0]), answers, bank: shuffled(answers.concat(extra)), why: tipOf(lesson) };
   }
 
-  const typeSentence = (item, lesson) => ({ type: 'type', item, prompt: meaning(item), answer: tx(item), why: tipOf(lesson) });
+  const typeSentence = (item, lesson) => {
+    const f = focus(item, target);
+    return { type: 'type', item, prompt: meaning(item), answer: tx(item), why: tipOf(lesson), accepted: accepted(item, target), strict: f ? [f.answer] : [] };
+  };
+
+  /** Auf A1 und A2 wird im Gespräch nur die Lücke geschrieben, ab B1 die ganze Zeile. */
+  const writesWholeLines = lesson => !levelOf(target, lesson).name.startsWith('A');
+
+  /**
+   * Gespräch: die Zeilen des Gegenübers erscheinen von selbst, bei den eigenen wählt man die Lücke
+   * (write = false) oder schreibt sie selbst – nur die Lücke (gapped gesetzt) oder die ganze Zeile.
+   */
+  function talk(lesson, write) {
+    const whole = write && writesWholeLines(lesson);
+    const turns = lesson.talk.map(line => {
+      const item = line.item;
+      const turn = { speaker: line.speaker, text: tx(item), meaning: meaning(item), you: line.you };
+      if (!line.you) return turn;
+      const f = focus(item, target);
+      if (whole) return { ...turn, gapped: null, answer: tx(item), options: [], accepted: accepted(item, target), strict: f ? [f.answer] : [] };
+      const g = gap(item, lesson);
+      return { ...turn, gapped: g.gapped, answer: g.answer, options: g.options, accepted: [g.answer], strict: [g.answer] };
+    });
+    const first = lesson.talk.find(l => l.you).item;
+    return { type: 'talk', item: first, title: lesson.title[base], turns, write, why: tipOf(lesson) };
+  }
 
   /** Eintrag für Übungen außerhalb der Lektionen; zählt nicht für die Wiederholung. */
   const helper = (id, label, targetText = label) =>
@@ -235,6 +365,11 @@ function Exercises(c) {
       }
       const tip = tipOf(lesson);
       if (tip) steps.push({ type: 'explain', tip });
+      // Gesprächs-Kachel: das Gespräch selbst, eigene Zeilen als Lücke zum Auswählen.
+      if (lesson.talk.length) {
+        steps.push(talk(lesson, false));
+        return steps;
+      }
       for (const s of lesson.sentences) {
         if (focus(s, target)) steps.push(gap(s, lesson));
         else { steps.push({ type: 'intro', item: s, sentence: true }); steps.push(build(s, lesson)); }
@@ -300,6 +435,12 @@ function Exercises(c) {
           else steps.push(choice(w, 'Listening', lesson.words));
         });
         if (gapText) steps.push(gapText);
+        // Im Gespräch zusätzlich zwei eigene Zeilen zusammenbauen.
+        if (lesson.talk.length) shuffled(lesson.sentences).slice(0, 2).forEach(s => steps.push(build(s, lesson)));
+      } else if (lesson.talk.length) {
+        // Das Gespräch noch einmal führen, jetzt selbst geschrieben – auf A1/A2 nur die Lücke, danach die ganze Zeile.
+        steps.push(talk(lesson, true));
+        if (canSpeak) { const s = pick(lesson.sentences); steps.push({ type: 'speak', item: s, text: tx(s) }); }
       } else {
         shuffled(lesson.sentences).forEach((s, n) => {
           if (n % 3 === 0) steps.push(build(s, lesson));
@@ -346,7 +487,7 @@ function Exercises(c) {
       for (const [verb, form] of shuffled(picks).slice(0, 4)) {
         const label = `${verb.inf} · ${verb.tense} · ${form[0]}`;
         const answer = verbLine(form);
-        steps.push({ type: 'type', item: helper('drill:' + label, label, answer), prompt: label, answer, why: tip });
+        steps.push({ type: 'type', item: helper('drill:' + label, label, answer), prompt: label, answer, why: tip, accepted: [answer], strict: [] });
       }
       if (drill.sort) steps.push(sort(drill.sort, tip));
       return steps;
@@ -384,6 +525,7 @@ function Exercises(c) {
         case 'gap': return { ...ex, options: shuffled(ex.options) };
         case 'cloze': return { ...ex, bank: shuffled(ex.bank) };
         case 'sort': return { ...ex, entries: shuffled(ex.entries) };
+        case 'talk': return { ...ex, turns: ex.turns.map(t => ({ ...t, options: shuffled(t.options || []) })) };
         default: return { ...ex };
       }
     },
@@ -737,6 +879,8 @@ const EXTRAS = {
     betWon: (d, s) => `Gewonnen! 🎉 Ich habe ${d} Tage in Folge durchgezogen.` + (s.trim() ? ` Du schuldest mir: ${s}. Danke im Voraus.` : ''),
     save: 'Speichern', awardNew: 'Unit geschafft – Auszeichnung!', awardShare: 'Auszeichnung senden', awards: 'Deine Auszeichnungen',
     awardsEmpty: 'Schliesse eine Unit ab, dann gibt es hier etwas zum Angeben.', awardFooter: l => `Offiziell verliehen von Lingua · ${l}`,
+    typoHint: 'Fast richtig – nur ein kleiner Tippfehler', talkYou: 'Du', talkWrite: 'Schreib deine Antwort',
+    talkStageHints: ['Redemittel lernen, Gespräch mit Lücken', 'Wörter schreiben, Lückentext, Sätze bauen', 'Das Gespräch selbst schreiben'],
     copied: 'In die Zwischenablage kopiert', copyHint: 'Text zum Kopieren',
   },
   en: {
@@ -756,6 +900,8 @@ const EXTRAS = {
     betWon: (d, s) => `I won! 🎉 I kept it up for ${d} days in a row.` + (s.trim() ? ` You owe me: ${s}. Thanks in advance.` : ''),
     save: 'Save', awardNew: 'Unit complete – award!', awardShare: 'Send award', awards: 'Your awards',
     awardsEmpty: "Finish a unit and you'll have something to brag about here.", awardFooter: l => `Officially awarded by Lingua · ${l}`,
+    typoHint: 'Almost – just a small typo', talkYou: 'You', talkWrite: 'Write your reply',
+    talkStageHints: ['Learn the phrases, conversation with gaps', 'Write words, gap text, build sentences', 'Write the conversation yourself'],
     copied: 'Copied to clipboard', copyHint: 'Text to copy',
   },
   fr: {
@@ -775,6 +921,8 @@ const EXTRAS = {
     betWon: (d, s) => `Gagné ! 🎉 J'ai tenu ${d} jours d'affilée.` + (s.trim() ? ` Tu me dois : ${s}. Merci d'avance.` : ''),
     save: 'Enregistrer', awardNew: 'Unité terminée – distinction !', awardShare: 'Envoyer la distinction', awards: 'Tes distinctions',
     awardsEmpty: 'Termine une unité et tu auras de quoi te vanter ici.', awardFooter: l => `Décerné officiellement par Lingua · ${l}`,
+    typoHint: 'Presque – juste une petite faute de frappe', talkYou: 'Toi', talkWrite: 'Écris ta réponse',
+    talkStageHints: ['Apprendre les expressions, dialogue à trous', 'Écrire les mots, texte à trous, construire des phrases', 'Écrire toi-même le dialogue'],
     copied: 'Copié dans le presse-papiers', copyHint: 'Texte à copier',
   },
 };
@@ -1066,7 +1214,7 @@ function stagePopup(lesson, c, p) {
       },
       h('div', { class: 'grow' },
         h('div', { class: 'title-m' }, `${stage} · ${X.stageNames[stage - 1]}`),
-        h('div', { class: 'body-s muted' }, X.stageHints[stage - 1])),
+        h('div', { class: 'body-s muted' }, (lesson.talk.length ? X.talkStageHints : X.stageHints)[stage - 1])),
       done.has(stage) && h('span', { style: 'color:var(--tertiary);display:flex' }, icon('check'))))),
     actions: close => [h('button', { class: 'text-btn', onclick: close }, S.cancel)],
   });
@@ -1505,6 +1653,7 @@ function stepView(step, c, s, done) {
     case 'cloze': return clozeStep(step, c, finished);
     case 'sort': return sortStep(step, c, finished);
     case 'card': return cardStep(step, c, finished);
+    case 'talk': return talkStep(step, c, finished);
   }
 }
 
@@ -1600,47 +1749,147 @@ function choiceStep(step, c, s, finished, cantListen) {
   return frame(promptText, [top], [cards, cantBtn], null);
 }
 
-/** Vergleichsform: ohne Groß/Klein, Satzzeichen und doppelte Leerzeichen. */
-const normalize = t => tokens(t.toLowerCase().replace(/’/g, "'")).join(' ');
-const stripAccents = t => t.normalize('NFD').replace(/\p{M}/gu, '').replace(/œ/g, 'oe').replace(/ß/g, 'ss');
-
-function typeStep(step, c, finished) {
-  let checked = false;
-  const input = h('input', {
-    class: 'text-field', type: 'text', placeholder: S.typeHere, autofocus: true,
-    autocomplete: 'off', autocorrect: 'off', autocapitalize: 'none', spellcheck: 'false', enterkeyhint: 'done',
-    lang: LANGS[c.target].speech,
-    oninput: () => { btn.disabled = !input.value.trim(); },
-    onkeydown: e => { if (e.key === 'Enter') { e.preventDefault(); check(); } },
-  });
-  const btn = h('button', { class: 'btn', disabled: true, onclick: () => check() }, S.check);
-  // Tipp: verrät Buchstabe für Buchstabe den Anfang, der Rest bleibt verdeckt.
-  let hints = 0;
-  const chars = Array.from(step.answer);
+/**
+ * Tipp für Schreibaufgaben: deckt bei jedem Antippen einen weiteren Buchstaben an zufälliger Stelle auf,
+ * Leerzeichen und Satzzeichen sind von Anfang an sichtbar.
+ */
+function hintRow(answer, input) {
+  const chars = Array.from(answer);
+  const isLetter = ch => /[\p{L}\p{N}]/u.test(ch);
+  const order = shuffled(chars.map((ch, i) => i).filter(i => isLetter(chars[i])));
+  let shown = 0;
   const hintText = h('span', { class: 'title-m hint-text' });
-  const hintRow = h('div', { class: 'row' },
+  return h('div', { class: 'row' },
     h('button', {
       class: 'text-btn', onclick: () => {
-        if (hints < chars.length) hints++;
-        hintText.textContent = chars.map((ch, i) => i < hints || ch === ' ' ? ch : '_').join(' ');
+        if (shown < order.length) shown++;
+        const open = new Set(order.slice(0, shown));
+        hintText.textContent = chars.map((ch, i) => open.has(i) || !isLetter(ch) ? ch : '_').join(' ');
         input.focus();
       },
     }, X.hint),
     hintText);
-  const el = frame(S.promptType(c.target), [h('div', { class: 'h1' }, step.prompt), input, hintRow], null, h('div', { class: 'bottom' }, btn));
+}
+
+function textField(placeholder, c, onEnter, onInput) {
+  return h('input', {
+    class: 'text-field', type: 'text', placeholder, autofocus: true,
+    autocomplete: 'off', autocorrect: 'off', autocapitalize: 'none', spellcheck: 'false', enterkeyhint: 'done',
+    lang: LANGS[c.target].speech,
+    oninput: onInput,
+    onkeydown: e => { if (e.key === 'Enter') { e.preventDefault(); onEnter(); } },
+  });
+}
+
+/** Selbst schreiben: Bedeutung sehen, Zielsprache eintippen. Fehlende Akzente, kleine Tippfehler und andere richtige Fassungen gelten. */
+function typeStep(step, c, finished) {
+  let checked = false;
+  const input = textField(S.typeHere, c, () => check(), () => { btn.disabled = !input.value.trim(); });
+  const btn = h('button', { class: 'btn', disabled: true, onclick: () => check() }, S.check);
+  const hints = hintRow(step.answer, input);
+  const el = frame(S.promptType(c.target), [h('div', { class: 'h1' }, step.prompt), input, hints], null, h('div', { class: 'bottom' }, btn));
   function check() {
     if (checked || !input.value.trim()) return;
-    const want = normalize(step.answer), got = normalize(input.value);
-    const correct = got === want || stripAccents(got) === stripAccents(want);
-    const accentsOff = correct && got !== want;
+    const g = Answers.grade(input.value, step.accepted || [step.answer], c.target, step.strict || []);
+    const correct = g.verdict !== 'wrong';
     checked = true;
     input.readOnly = true;
-    Speaker.speak(step.answer);
+    Speaker.speak(correct ? g.match : step.answer);
     input.blur();
-    hintRow.remove();
-    el.setBottom(feedbackBar(correct, accentsOff ? S.accentHint : correct ? S.correct : S.correctAnswerIs,
-      step.answer, step.prompt, () => finished(!correct), !correct && step.why));
+    hints.remove();
+    // Die getroffene bzw. ähnlichste richtige Fassung zeigen.
+    el.setBottom(feedbackBar(correct, gradeTitle(g), g.match, step.prompt, () => finished(!correct), !correct && step.why));
   }
+  return el;
+}
+
+/**
+ * Gespräch führen: Die Zeilen des Gegenübers erscheinen nacheinander und werden vorgelesen. Bei den
+ * eigenen Zeilen wählt man die Lücke aus oder schreibt sie (bzw. die ganze Zeile) selbst.
+ */
+function talkStep(step, c, finished) {
+  let index = 0, mistakes = false;
+  const log = h('div', { class: 'talk-log' });
+  const controls = h('div', { class: 'controls' });
+  const body = h('div', { class: 'step-body' }, h('div', { class: 'prompt' }, step.title), log);
+  const bottomSlot = h('div', {}, h('div', { class: 'bottom-empty' }));
+  const el = h('div', { class: 'step' }, body, controls, bottomSlot);
+
+  const bubble = (turn, shownText, active) => h('div', { class: 'talk-row' + (turn.you ? ' you' : '') },
+    h('button', {
+      class: 'bubble' + (turn.you ? ' you' : '') + (active ? ' active' : ''),
+      onclick: () => { if (!active) Speaker.speak(turn.text); },
+    },
+    h('div', { class: 'bubble-name' }, turn.you ? X.talkYou : turn.speaker),
+    h('div', { class: 'title-m' }, shownText),
+    h('div', { class: 'body-s muted' }, turn.meaning)));
+
+  const scrollDown = () => setTimeout(() => { body.scrollTop = body.scrollHeight; }, 0);
+
+  /** Eigene Zeile erledigt: die aktive Blase durch die fertige ersetzen. Eine andere richtige Fassung bleibt so stehen, wie man sie geschrieben hat. */
+  function next(shownText) {
+    const turn = step.turns[index];
+    log.lastElementChild?.replaceWith(bubble(turn, shownText || turn.text, false));
+    index++;
+    show();
+  }
+
+  function show() {
+    controls.replaceChildren();
+    const turn = step.turns[index];
+    if (!turn) {
+      bottomSlot.replaceChildren(feedbackBar(!mistakes, mistakes ? S.withMistakes : S.correct, '', '', () => finished(mistakes), mistakes && step.why));
+      scrollDown();
+      return;
+    }
+    if (!turn.you) {
+      // Zeilen des Gegenübers laufen von selbst weiter, lange Zeilen etwas langsamer.
+      log.append(bubble(turn, turn.text, false));
+      Speaker.speak(turn.text);
+      scrollDown();
+      setTimeout(() => { if (el.isConnected) { index++; show(); } }, Math.max(1400, turn.text.length * 60));
+      return;
+    }
+    log.append(bubble(turn, turn.gapped || '…', true));
+    scrollDown();
+    if (!step.write) {
+      const wrong = new Set();
+      for (const option of turn.options) {
+        const btn = h('button', {
+          class: 'option', onclick: () => {
+            if (wrong.has(option)) return;
+            if (option === turn.answer) { Speaker.speak(turn.text); next(); }
+            else { mistakes = true; wrong.add(option); btn.classList.add('wrong'); btn.disabled = true; vibrate(); }
+          },
+        }, option);
+        controls.append(btn);
+      }
+      return;
+    }
+    let checked = false;
+    const input = textField(X.talkWrite, c, () => check(), () => { btn.disabled = !input.value.trim(); });
+    const btn = h('button', { class: 'btn', disabled: true, onclick: () => check() }, S.check);
+    controls.append(input, hintRow(turn.answer, input), btn);
+    input.focus();
+    function check() {
+      if (checked || !input.value.trim()) return;
+      checked = true;
+      const g = Answers.grade(input.value, turn.accepted, c.target, turn.strict);
+      const ok = g.verdict !== 'wrong';
+      if (!ok) { mistakes = true; vibrate(); }
+      Speaker.speak(turn.text);
+      // Die eigene Eingabe bleibt sichtbar, damit man den Unterschied sieht.
+      controls.replaceChildren(
+        h('div', { class: 'talk-result' + (ok ? ' ok' : '') },
+          h('div', { class: 'body-m muted' }, `${X.talkYou}: ${input.value}`),
+          h('div', { class: 'title-m' }, gradeTitle(g)),
+          h('div', { class: 'body-l' }, turn.gapped == null ? g.match : turn.text)),
+        h('button', { class: 'btn', onclick: () => next(ok && turn.gapped == null ? g.match : turn.text) }, S.next));
+    }
+  }
+
+  // Erst loslegen, wenn das Element im Dokument hängt (Zeitgeber prüfen isConnected).
+  setTimeout(show, 0);
   return el;
 }
 

@@ -347,3 +347,15 @@ button.card-m.topic { display: flex; align-items: center; gap: 8px; min-height: 
   position: fixed; left: 50%; bottom: calc(88px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 20;
   padding: 10px 16px; border-radius: 999px; background: var(--on-surface); color: var(--bg); font-size: 14px; animation: fade 0.15s;
 }
+
+/* Gespräch: Gegenüber links, eigene Zeilen rechts */
+.talk-log { display: flex; flex-direction: column; gap: 10px; }
+.talk-row { display: flex; justify-content: flex-start; }
+.talk-row.you { justify-content: flex-end; }
+.bubble { max-width: 320px; padding: 10px 16px; border-radius: 20px; background: var(--surface-container); text-align: left; }
+.bubble.you { background: var(--primary-container); }
+.bubble.active { background: var(--surface-container-high); cursor: default; }
+.bubble-name { font-size: 12px; font-weight: 600; color: var(--primary); }
+.talk-result { padding: 14px; border-radius: 14px; background: var(--error-container); }
+.talk-result.ok { background: var(--tertiary-container); }
+.talk-result > * + * { margin-top: 4px; }
