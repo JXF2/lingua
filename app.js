@@ -13,6 +13,7 @@ const LANGS = {
   de: { code: 'de', speech: 'de-DE', flag: '🇩🇪' },
   fr: { code: 'fr', speech: 'fr-FR', flag: '🇫🇷' },
   en: { code: 'en', speech: 'en-GB', flag: '🇬🇧' },
+  es: { code: 'es', speech: 'es-ES', flag: '🇪🇸' },
 };
 
 let CONTENT = null; // { courses: [...], levels: { fr: [...], ... } }
@@ -70,7 +71,7 @@ function focus(item, lang) {
   return { gapped: gapped.replace(FOCUS_ALL, (_, a) => a), answer: m[1], alternatives };
 }
 
-const EDGE = new Set([',', '.', '?', '!', '«', '»', '"', ';', ':', '„', '“']);
+const EDGE = new Set([',', '.', '?', '!', '¿', '¡', '«', '»', '"', ';', ':', '„', '“']);
 function trimEdge(s) {
   let a = 0, b = s.length;
   while (a < b && EDGE.has(s[a])) a++;
@@ -750,9 +751,9 @@ const MODE_NAMES = {
   en: ['Choose the meaning', 'Translate', 'Listen', 'Letter jumble', 'Write', 'Speak'],
   fr: ['Choisir le sens', 'Traduire', 'Écouter', 'Lettres mélangées', 'Écrire', 'Parler'],
 };
-const deName = l => ({ fr: 'Französisch', en: 'Englisch', de: 'Deutsch' })[l];
-const enName = l => ({ fr: 'French', en: 'English', de: 'German' })[l];
-const frName = l => ({ fr: 'français', en: 'anglais', de: 'allemand' })[l];
+const deName = l => ({ fr: 'Französisch', en: 'Englisch', de: 'Deutsch', es: 'Spanisch' })[l];
+const enName = l => ({ fr: 'French', en: 'English', de: 'German', es: 'Spanish' })[l];
+const frName = l => ({ fr: 'français', en: 'anglais', de: 'allemand', es: 'espagnol' })[l];
 const levelLabel = (base, level) => `${level} · ${LEVEL_LABELS[base][LEVEL_NAMES.indexOf(level)] || ''}`;
 
 const STRINGS = {
